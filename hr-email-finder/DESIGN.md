@@ -102,6 +102,9 @@ Stay within the budget reported by get_candidates(); stop as soon as a candidate
   email may live on a parent/group domain.
 - Detects the ATS (Greenhouse, Lever, Workday, SmartRecruiters, Darwinbox, Zoho Recruit…) from the
   careers link — feeds Agent 4.
+- **Version 1:** runs only when no domain is given. A domain the user supplies is trusted and skips
+  the web search. Reports through a `submit_company_profile` tool; ambiguous when
+  `alternatives` is non-empty and `confidence < 0.6`.
 
 ### 3.2 Website Agent
 Priority page list (stop when a high-quality candidate is found):
@@ -112,8 +115,22 @@ Priority page list (stop when a high-quality candidate is found):
 5. `/about`, footer links, sitemap.xml entries containing career/hr/recruit keywords
 
 Extraction handles obfuscation: `hr [at] company [dot] com`, `mailto:` links, HTML entities,
-Cloudflare email protection (`/cdn-cgi/l/email-protection` decoding), and emails in images
-(optional OCR). Respects `robots.txt` and a per-domain rate limit.
+Cloudflare email protection (`/cdn-cgi/l/email-protection` decoding), JSON-LD `email` fields, and
+emails in images (optional OCR, later). Respects `robots.txt` and a per-domain rate limit.
+
+**Version 1 implementation:**
+- Tools: `list_site_pages` (ranked links from the homepage, then sitemap, then common paths),
+  `fetch_page` (fetch + extraction in one call, returns emails with context, relevant passages,
+  links and whether there's a contact form), `submit_findings` (finish).
+- Fetching is limited to the company's domains plus known ATS hosts. If the company's homepage
+  redirects to another domain (rebrand, group site), that domain is adopted as company-owned.
+- Emails come only from fetched pages; anything the agent reports that wasn't seen is dropped
+  and noted.
+- A rule-based crawler drives the same tools when there's no API key, with `--no-llm`, or when the
+  agent fails. It fetches relevant pages by rank and stops once an HR role address turns up on a
+  careers, contact or legal page.
+- "HR words nearby" is judged on the prose of the email's surrounding block, ignoring ordinary
+  link labels. Otherwise a menu's "Careers" link would count as context for every footer email.
 
 ### 3.3 Web Search Agent
 Query templates (the agent adapts them):
@@ -158,18 +175,26 @@ Weighted, explainable score (0–1), clamped:
 | Signal | Weight |
 |---|---|
 | Found on company's own domain, on a careers/HR page | +0.45 |
+| Found on company's own domain, other page (contact, imprint, privacy, home…) | +0.30 |
 | Found in an official job posting (company ATS) | +0.35 |
 | Found on a third-party page only | +0.15 |
-| HR keywords (hr, career, recruit, talent, hiring, resume, CV) within 200 chars | +0.15 |
+| HR words (hr, career, recruit, talent, hiring, resume, CV…) in the prose around it — link labels ignored | +0.15 |
 | Role-based local part (`hr`, `careers`, `jobs`…) | +0.10 |
 | Mailbox `valid` / `catch_all` / `unknown` | +0.15 / +0.05 / 0 |
-| Seen on ≥ 2 independent sources | +0.10 |
+| Seen on ≥ 2 independent sites | +0.10 |
+| Seen on ≥ 2 pages of one site | +0.05 |
 | Domain not company-owned | −0.50 |
-| Free / disposable mailbox | −0.30 |
+| Free / disposable mailbox (on a domain the company doesn't own) | −0.30 |
 | `inferred` (never observed) | cap at 0.50 |
-| Mailbox `invalid` | reject |
+| Invalid syntax, no MX/A record, mailbox `invalid`, or missing from its source page | reject |
 
-Every applied rule is recorded in `reasons[]` so the report can explain the score.
+Every applied rule is recorded in `reasons[]` so the report can explain the score. The top
+candidate becomes `best_email` only at **score ≥ 0.40**; below that it is listed as an
+alternative (e.g. `info@` on a contact page scores 0.30).
+
+Candidates are filtered before scoring. Other departments (`sales@`, `press@`, `privacy@`,
+`noreply@`…) are dropped unless the agent labels them HR. Personal addresses are hidden unless
+`allow_named_contacts` is set.
 
 ### 3.8 Reporter
 Single Claude call with **structured outputs** (`output_config.format` with the `FinalReport`
@@ -202,16 +227,20 @@ class CompanyProfile(BaseModel):
 class EmailCandidate(BaseModel):
     email: str
     kind: Literal["role_based", "named_person", "generic", "inferred"]
-    department_hint: str | None              # "HR", "Recruiting", "General"
+    department_hint: Literal["HR", "Recruiting", "Campus", "General", "Other"] | None
+    source_kind: SourceKind                  # "company_site", "ats", "third_party_page", ... (§11.17)
     source_url: str | None                   # None only for inferred
+    source_page_type: Literal["careers", "contact", "legal", "privacy", "about", "home", "other"] | None
     snippet: str | None                      # exact text around the email
+    hr_context: bool | None                  # HR words in the surrounding prose (§3.2)
+    other_source_urls: list[str]             # further pages it appeared on
     found_by: str                            # agent name
     found_at: datetime
 
 class VerificationResult(BaseModel):
     syntax_ok: bool
     domain_owned: bool
-    mx_ok: bool
+    mx_ok: bool | None                       # None = DNS lookup failed (not a rejection)
     mailbox: Literal["valid", "invalid", "catch_all", "unknown"]
     disposable_or_free: bool
     evidence_confirmed: bool | None
@@ -220,17 +249,22 @@ class RankedCandidate(BaseModel):
     candidate: EmailCandidate
     verification: VerificationResult
     score: float
+    rejected: bool
     reasons: list[str]
 
 class FinalReport(BaseModel):
-    company: CompanyProfile
+    query: CompanyQuery
+    company: CompanyProfile | None
+    status: Literal["found", "inferred_only", "not_found", "ambiguous_company"]
     best_email: RankedCandidate | None
     alternatives: list[RankedCandidate]
     careers_portal_url: str | None
     contact_form_url: str | None
-    status: Literal["found", "inferred_only", "not_found", "ambiguous_company"]
     explanation: str
-    cost_usd: float
+    notes: list[str]                         # fallbacks used, hidden/rejected emails, agent notes
+    pages_fetched: int
+    web_searches: int
+    cost_usd: float                          # Claude tokens at list price; excludes web search fees
     duration_ms: int
 ```
 
@@ -240,9 +274,10 @@ class FinalReport(BaseModel):
 
 | Tool | Args | Notes |
 |---|---|---|
-| `crawl_site` | `domain`, `paths[]`, `max_pages` | robots.txt aware, per-domain rate limit, returns cleaned text + links |
-| `fetch_page` | `url` | httpx + readability cleanup; JS-heavy pages → Playwright fallback |
-| `extract_emails` | `text`, `url` | regex + de-obfuscation + Cloudflare decode; returns emails with ±200-char snippets |
+| `list_site_pages` | `domain` | ranked careers/contact/legal links from homepage → sitemap → common paths |
+| `fetch_page` | `url` | robots.txt aware, per-host limits, page budget; extracts emails (regex + de-obfuscation + Cloudflare + JSON-LD) with context; JS-heavy pages → Playwright later (§11.9) |
+| `submit_findings` | `candidates[]`, `careers_url`, `contact_form_url`, `notes` | Website Agent's finish tool |
+| `submit_company_profile` | `CompanyProfile` fields | Resolver's finish tool |
 | `company_lookup` | `name`, `country?` | optional enrichment API (domain, size, industry) |
 | `ats_api` | `provider`, `board_token` | public Greenhouse/Lever/etc. job-board endpoints |
 | `dispatch_worker` | `worker`, `instructions` | orchestrator → worker (runs a sub-agent loop) |
@@ -256,9 +291,15 @@ Server-side tools (Anthropic-hosted): `web_search_20260209` and `web_fetch_20260
 
 ## 6. Implementation stack
 
-- **Language:** Python 3.11+ (assumed — say if you prefer TypeScript).
-- **Agent runtime:** Anthropic Python SDK — **Tool Runner** (`client.beta.messages.tool_runner`
-  with `@beta_tool`) for each agent loop; the pipeline/state machine is plain `asyncio`.
+- **Language:** Python 3.10+.
+- **Agent runtime:** Anthropic Python SDK (`anthropic` 1.x) with a small hand-written async agent
+  loop (`hr_email_finder/llm.py`); the pipeline is plain `asyncio`. Not the SDK's beta Tool Runner:
+  - the Python runner ends silently on a `pause_turn` from server tools (web search/fetch);
+  - we want per-response cost/budget accounting;
+  - parallel tool calls should run concurrently.
+
+  The loop gives the model a finish tool (`submit_*`), nudges once if it stops without calling
+  it, and turns refusals, `max_tokens` and turn limits into a typed `AgentError`.
   *Alternative:* Claude Managed Agents multiagent sessions if you want Anthropic to host the loop;
   but DNS/SMTP verification and crawling still need your own infra, so self-hosting is simpler here.
 - **Model API notes (current models):**
@@ -270,25 +311,29 @@ Server-side tools (Anthropic-hosted): `web_search_20260209` and `web_fetch_20260
     (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`).
   - Prompt-cache each agent's static system prompt + tool list.
   - Return all parallel `tool_result` blocks in a single user message.
-- **Crawling:** `httpx` (async) + `selectolax`/`readability-lxml`; Playwright for JS-rendered pages.
+- **Crawling:** `httpx` (async) + BeautifulSoup; Playwright for JS-rendered pages (§11.9).
 - **DNS / verification:** `dnspython`; optional verification-provider API.
 - **API:** FastAPI — `POST /lookup` (sync, ≤ 60 s) and `POST /lookup/batch` (async job + webhook).
 - **Storage:** Postgres (results, evidence, audit log) + Redis (cache, rate limits, job queue).
 - **Observability:** OpenTelemetry traces per run (agent → tool spans), token + cost per run.
 
-### Suggested layout
+### Layout
+Built in version 1 step 1: `cli.py`, `pipeline.py`, `schemas.py`, `scoring.py`, `llm.py`,
+`agents/resolver.py`, `agents/website.py`, and `tools/` (`http.py`, `site.py`, `html.py`,
+`extract.py`, `mx.py`, `verify.py`). The rest arrives with later steps.
 ```
 hr-email-finder/
-  app/
-    api.py                 # FastAPI endpoints
+  hr_email_finder/
+    cli.py                 # command line
+    api.py                 # FastAPI endpoints (step 4)
     pipeline.py            # state machine / orchestrator wiring
     schemas.py             # Pydantic contracts (§4)
     scoring.py             # §3.7
+    llm.py                 # agent loop + cost tracking
     agents/
       orchestrator.py  resolver.py  website.py  search.py  ats.py  inference.py  reporter.py
     tools/
-      crawl.py  robots.py  extract.py  dns.py  verify.py  ats_api.py  cache.py
-    prompts/               # one .md system prompt per agent
+      http.py  site.py  html.py  extract.py  mx.py  verify.py  ats_api.py  cache.py
   evals/
     golden.jsonl           # company → known HR email(s)
     run_eval.py
@@ -355,6 +400,7 @@ Run the eval on every prompt/model change; compare configs (all-Opus-low vs Sonn
 ## 10. Build plan (version 1)
 
 1. **MVP (no LLM orchestration):** Resolver + Website Agent + Verifier + Scorer → CLI.
+   ✅ Built — see `README.md`.
 2. Add Web Search + ATS agents in parallel, aggregator, early exit.
 3. Add Orchestrator agent, Pattern Inference, Reporter with structured output.
 4. FastAPI service, caching, batch endpoint, observability.
@@ -747,7 +793,7 @@ subsidiaries, rebranded companies).
 ### 11.20 Version 2 code layout (additions)
 
 ```
-hr-email-finder/app/
+hr-email-finder/hr_email_finder/
   agents/   critic.py  browser.py  drafter.py
   tools/    graph.py  render.py  mx_provider.py  enrichment/  (one adapter per provider)
   learning/ scorer_model.py  calibration.py  strategy_memory.py
