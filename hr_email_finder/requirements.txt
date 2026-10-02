@@ -1,0 +1,4 @@
+anthropic>=0.116.0
+httpx>=0.27
+dnspython>=2.6
+pytest>=8
